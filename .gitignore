@@ -1,0 +1,28 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.crt
+*.key
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+
+.DS_Store
+.idea
+main
+spacer/spacer.go
+spacer/spacer_wrap.c
+panaudia-licence.txt
+keys/
+moq-client/
+moq-test-page/
+
+CLAUDE.md
+

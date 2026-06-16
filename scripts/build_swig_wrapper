@@ -1,0 +1,10 @@
+#!/bin/bash
+
+
+BASEDIR="$( dirname "$0" )"
+cd "$BASEDIR"
+cd ../spacer
+swig -go -cgo -intgosize 64 spacer.i
+
+
+

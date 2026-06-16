@@ -1,0 +1,28 @@
+#!/bin/bash
+
+export LDFLAGS="-L /usr/local/opt/openblas/lib"
+export CFLAGS="-I /usr/local/opt/openblas/include"
+
+BASEDIR="$( dirname "$0" )"
+cd "$BASEDIR"
+cd ../../Spatial_Audio_Framework
+rm -rf build
+cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=1 -DCMAKE_OSX_ARCHITECTURES="x86_64" -DSAF_BUILD_TESTS=0 -Dsaf_example_list=ambi_bin
+cd build
+make
+
+cp ./framework/libsaf.a /usr/local/lib/libsaf.a
+cp ./examples/libsaf_example_ambi_bin.a /usr/local/lib/libsaf_example_ambi_bin.a
+
+
+cd "$BASEDIR"
+cd ../../panaudia-utils
+rm -rf build
+cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=1 -DCMAKE_OSX_ARCHITECTURES="x86_64" -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0 -DSAF_BUILD_EXAMPLES=0
+cd build
+make
+
+cp ./libpanaudia_utils.a /usr/local/lib/libpanaudia_utils.a
+
+
+
