@@ -103,6 +103,12 @@ RUN mkdir -p /opt/panaudia/bin
 
 COPY --from=builder /opt/panaudia/panaudia/main /opt/panaudia/bin/panaudia
 
+# Third-party licence notices + the project licence travel with the binary —
+# required when distributing the built image, which links MIT/BSD/ISC/Apache
+# and MPL-2.0 (roc-toolkit/roc-vad) dependencies.
+COPY --from=builder /opt/panaudia/panaudia/third-party-licences.md /licenses/THIRD-PARTY-LICENCES.md
+COPY --from=builder /opt/panaudia/panaudia/LICENSE /licenses/LICENSE
+
 ENV LD_LIBRARY_PATH=/usr/local/lib;/usr/lib
 RUN setcap CAP_NET_BIND_SERVICE=+eip /opt/panaudia/bin/panaudia
 
@@ -113,4 +119,3 @@ RUN ldconfig
 USER small-user:small-user
 
 WORKDIR /opt/panaudia/bin
-

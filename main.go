@@ -2,12 +2,14 @@ package main
 
 import (
 	"crypto/tls"
+	_ "embed"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +30,13 @@ import (
 var (
 	cfg config
 )
+
+// version is compiled in from the repo's top-level `version` file (the same
+// file the docker build scripts tag images with), so the startup banner and
+// the image tag never drift.
+//
+//go:embed version
+var version string
 
 type config struct {
 	Host          string `env:"PANAUDIA_HOST" default:"0.0.0.0"`
@@ -92,7 +101,7 @@ func main() {
 	fmt.Printf("\n             --- A Network Spatial Audio Engine ---\n")
 	fmt.Printf("\n                      https://panaudia.com\n")
 
-	fmt.Printf("\n                    v0.2.1 (Unified MOQ+WebRTC+ROC)\n\n")
+	fmt.Printf("\n                    v%s (Unified MOQ+WebRTC+ROC)\n\n", strings.TrimSpace(version))
 
 	fmt.Printf("-----------------------------------------------------------------\n")
 	fmt.Printf("Config \n")

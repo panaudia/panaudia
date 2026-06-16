@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+
+# Build the amd64 Panaudia image. The tag's version comes from the repo's
+# top-level `version` file (e.g. "0.2.1" -> panaudia/panaudia:0.2.1-amd64)
+# rather than a fixed "latest".
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+VERSION_FILE="$SCRIPT_DIR/../../version"
+
+if [ ! -f "$VERSION_FILE" ]; then
+  echo "error: version file not found at $VERSION_FILE" >&2
+  exit 1
+fi
+
+# Read and strip any surrounding whitespace/newline.
+VERSION="$( tr -d '[:space:]' < "$VERSION_FILE" )"
+if [ -z "$VERSION" ]; then
+  echo "error: version file is empty: $VERSION_FILE" >&2
+  exit 1
+fi
+
+IMAGE="panaudia/panaudia:${VERSION}-amd64"
+echo "Building $IMAGE"
+
+docker buildx build --platform linux/amd64 --no-cache -t "$IMAGE" "$SCRIPT_DIR"
