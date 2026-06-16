@@ -10,6 +10,17 @@ variables. Most are read at startup into the config struct in `main.go`; a few
 - **Defaults** are shown below; an unset variable uses its default.
 - The values in force are printed in the **Config** banner when the server starts.
 
+**Loading from a `.env` file (optional)**
+
+On startup, before reading the variables below, the server loads a `.env` file
+from the working directory **if one exists** — a missing file is not an error.
+Copy [`.env.example`](../.env.example) to `.env` and uncomment what you need.
+Override the path with `PANAUDIA_ENV_FILE` (which must itself be a real
+environment variable). Precedence is **real environment > `.env` file >
+default**: the loader never overwrites a variable that is already set, so a `.env`
+only fills in what the environment hasn't. Keep secrets out of version control —
+`.env` is git-ignored; `.env.example` is not.
+
 ---
 
 ## Network & transport

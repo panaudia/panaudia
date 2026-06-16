@@ -14,6 +14,11 @@
 *.out
 
 
+# Local env files — never commit real config/secrets. .env.example IS tracked.
+.env
+.env.local
+.env.*.local
+
 .DS_Store
 .idea
 main

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fabritsius/envar"
+	"github.com/joho/godotenv"
 	"github.com/panaudia/panaudia/core/binaural"
 	"github.com/panaudia/panaudia/core/commands"
 	"github.com/panaudia/panaudia/core/common"
@@ -63,7 +64,32 @@ type config struct {
 	LogLevel      int    `env:"PANAUDIA_LOG_LEVEL" default:"2"`
 }
 
+// loadDotEnv loads variables from a .env file into the process environment, if
+// the file is present. The path defaults to ".env" in the working directory and
+// can be overridden with PANAUDIA_ENV_FILE (an actual environment variable, so
+// it has to be set the normal way). A missing file is not an error; a malformed
+// one panics, consistent with how the rest of config loading fails fast.
+func loadDotEnv() {
+	path := os.Getenv("PANAUDIA_ENV_FILE")
+	if path == "" {
+		path = ".env"
+	}
+	if _, err := os.Stat(path); err != nil {
+		return // no .env file — rely on the environment and struct defaults
+	}
+	if err := godotenv.Load(path); err != nil {
+		panic(fmt.Errorf("loading %s: %w", path, err))
+	}
+}
+
 func main() {
+	// Optionally seed the environment from a .env file before reading config.
+	// The file is optional: a missing .env is fine (env vars / defaults still
+	// apply), but a malformed one fails fast. godotenv.Load (not Overload)
+	// never overwrites an already-set variable, so precedence stays:
+	// real environment > .env file > struct defaults.
+	loadDotEnv()
+
 	cfg = config{}
 	if err := envar.Fill(&cfg); err != nil {
 		panic(err)
