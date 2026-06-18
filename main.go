@@ -1,13 +1,21 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	_ "embed"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -45,9 +53,10 @@ type config struct {
 	GoMaxProcs    int    `env:"PANAUDIA_GOMAXPROCS" default:"4"`
 	ICEHost       string `env:"PANAUDIA_ICE_HOST" default:""`
 	ICEPort       int    `env:"PANAUDIA_ICE_PORT" default:"0"`
-	TLSCrtPath    string `env:"PANAUDIA_TLS_CTR_PATH" default:"keys/server.crt"`
-	TLSKeyPath    string `env:"PANAUDIA_TLS_KEY_PATH" default:"keys/server.key"`
-	TicketKeyPath string `env:"PANAUDIA_TICKET_KEY_PATH" default:"keys/panaudia_key.pub"`
+	TLSCrtPath    string `env:"PANAUDIA_TLS_CTR_PATH" default:"../keys/server.crt"`
+	TLSKeyPath    string `env:"PANAUDIA_TLS_KEY_PATH" default:"../keys/server.key"`
+	AutoGenTLS    int    `env:"PANAUDIA_TLS_AUTOGEN" default:"1"`
+	TicketKeyPath string `env:"PANAUDIA_TICKET_KEY_PATH" default:"../keys/panaudia_key.pub"`
 	Unticketed    int    `env:"PANAUDIA_UNTICKETED" default:"1"`
 	SpaceSize     int    `env:"PANAUDIA_SPACE_SIZE" default:"40"`
 	SpaceOrder    int    `env:"PANAUDIA_SPACE_ORDER" default:"3"`
@@ -64,22 +73,191 @@ type config struct {
 	LogLevel      int    `env:"PANAUDIA_LOG_LEVEL" default:"2"`
 }
 
-// loadDotEnv loads variables from a .env file into the process environment, if
-// the file is present. The path defaults to ".env" in the working directory and
-// can be overridden with PANAUDIA_ENV_FILE (an actual environment variable, so
-// it has to be set the normal way). A missing file is not an error; a malformed
-// one panics, consistent with how the rest of config loading fails fast.
-func loadDotEnv() {
-	path := os.Getenv("PANAUDIA_ENV_FILE")
-	if path == "" {
-		path = ".env"
+// runningInBundle reports whether the executable is running from inside a macOS
+// .app bundle, i.e. at …/Contents/MacOS/<exe> with …/Contents/Info.plist
+// alongside. Used to decide where installed config/data lives.
+func runningInBundle() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
 	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	info, err := os.Stat(filepath.Join(filepath.Dir(exe), "..", "Info.plist"))
+	return err == nil && !info.IsDir()
+}
+
+// configRoot is the directory the installed app reads its config and data
+// (.env, keys/) from. Inside a .app bundle it is the per-user
+// ~/Library/Application Support/Panaudia (os.UserConfigDir). Everywhere else — a
+// dev checkout, Linux, Docker — it returns "", meaning "leave the CWD-relative
+// defaults untouched", so behaviour outside a bundle is exactly as before.
+func configRoot() string {
+	if !runningInBundle() {
+		return ""
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "Panaudia")
+}
+
+// licensesDir returns the directory holding the shipped LICENSE and
+// third-party-licences.md. Inside a .app they are bundled in Contents/Resources
+// (next to the executable, sealed by the code signature); in a dev checkout /
+// Linux / Docker they live at the repo (working-directory) root, so it returns
+// ".". These are immutable distribution artifacts — they are NOT copied into the
+// config dir, only pointed at from the startup banner.
+func licensesDir() string {
+	if !runningInBundle() {
+		return "."
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Join(filepath.Dir(exe), "..", "Resources")
+}
+
+// loadDotEnv loads variables from a .env file into the process environment, if
+// present. Resolution order for the path:
+//
+//  1. PANAUDIA_ENV_FILE, if set (an actual environment variable).
+//  2. inside a .app bundle: <configRoot>/.env
+//  3. otherwise: ".env" in the working directory.
+//
+// A missing file is not an error; a malformed one panics, consistent with how
+// the rest of config loading fails fast. godotenv.Load (not Overload) never
+// overwrites an already-set variable, so precedence stays:
+// real environment > .env file > struct defaults.
+func loadDotEnv() {
+	path := dotEnvPath()
 	if _, err := os.Stat(path); err != nil {
 		return // no .env file — rely on the environment and struct defaults
 	}
 	if err := godotenv.Load(path); err != nil {
 		panic(fmt.Errorf("loading %s: %w", path, err))
 	}
+}
+
+// dotEnvPath returns the path loadDotEnv reads from, following the resolution
+// order documented there. It does not check whether the file exists; it is also
+// used by the startup banner to tell the operator which file to edit.
+func dotEnvPath() string {
+	if path := os.Getenv("PANAUDIA_ENV_FILE"); path != "" {
+		return path
+	}
+	if root := configRoot(); root != "" {
+		return filepath.Join(root, ".env")
+	}
+	return ".env"
+}
+
+// resolveKeyPaths rebases the default cert/key/ticket locations into the bundle
+// config dir (<configRoot>/keys/) when running as a .app. A path whose env var
+// was explicitly set is honoured verbatim — that is the production/operator
+// override, including the file-path contract cloud-mixer relies on. Outside a
+// bundle this is a no-op, so dev/Linux/Docker keep their CWD-relative "keys/…"
+// defaults.
+func resolveKeyPaths() {
+	root := configRoot()
+	if root == "" {
+		return
+	}
+	for _, p := range []struct {
+		env string
+		ptr *string
+	}{
+		{"PANAUDIA_TLS_CTR_PATH", &cfg.TLSCrtPath},
+		{"PANAUDIA_TLS_KEY_PATH", &cfg.TLSKeyPath},
+		{"PANAUDIA_TICKET_KEY_PATH", &cfg.TicketKeyPath},
+	} {
+		if _, set := os.LookupEnv(p.env); set {
+			continue // explicit override — leave untouched
+		}
+		*p.ptr = filepath.Join(root, "keys", filepath.Base(*p.ptr))
+	}
+}
+
+// ensureTLSCert generates a self-signed cert/key pair at the configured paths
+// when either is missing, so the standalone server runs out of the box: a fresh
+// checkout (keys/ is gitignored), a Linux/Docker run with no mounted certs, or
+// the macOS .app. It is a pure fallback — existing files (which production always
+// provides) are never touched — and can be disabled with PANAUDIA_TLS_AUTOGEN=0.
+// Because it writes the files to disk, the shared core still just
+// LoadX509KeyPair()s the path and finds them; no core/cloud change is involved.
+func ensureTLSCert() {
+	if cfg.AutoGenTLS == 0 {
+		return
+	}
+	_, crtErr := os.Stat(cfg.TLSCrtPath)
+	_, keyErr := os.Stat(cfg.TLSKeyPath)
+	if crtErr == nil && keyErr == nil {
+		return // both present — use as-is
+	}
+	if err := generateSelfSignedCert(cfg.TLSCrtPath, cfg.TLSKeyPath, cfg.ICEHost); err != nil {
+		panic(fmt.Errorf("auto-generating TLS cert: %w", err))
+	}
+	fmt.Printf("Generated self-signed TLS certificate: %s\n", cfg.TLSCrtPath)
+}
+
+// generateSelfSignedCert writes a fresh ECDSA P-256 self-signed cert + key (PEM)
+// to crtPath/keyPath. The SAN covers localhost and loopback, plus iceHost (the
+// advertised address, PANAUDIA_ICE_HOST) when set — enough for local/LAN clients
+// that pin or trust-on-first-use the cert. WebRTC media verifies by certificate
+// fingerprint via signalling, not by name, so the SAN only matters to the
+// HTTPS/QUIC side.
+func generateSelfSignedCert(crtPath, keyPath, iceHost string) error {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return err
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "localhost", Organization: []string{"Panaudia (self-signed)"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+	if iceHost != "" {
+		if ip := net.ParseIP(iceHost); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, iceHost)
+		}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(crtPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(crtPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600)
 }
 
 func main() {
@@ -94,6 +272,13 @@ func main() {
 	if err := envar.Fill(&cfg); err != nil {
 		panic(err)
 	}
+
+	// Rebase the default cert/key/ticket paths into the bundle config dir when
+	// running as a .app; a no-op outside a bundle. Then make sure a TLS cert
+	// exists at the resolved path (generating a self-signed one if absent) so the
+	// standalone server runs out of the box.
+	resolveKeyPaths()
+	ensureTLSCert()
 
 	runtime.GOMAXPROCS(cfg.GoMaxProcs)
 
@@ -130,8 +315,19 @@ func main() {
 	fmt.Printf("\n                    v%s (Unified MOQ+WebRTC+ROC)\n\n", strings.TrimSpace(version))
 
 	fmt.Printf("-----------------------------------------------------------------\n")
-	fmt.Printf("Config \n")
-	fmt.Printf("-----------------------------------------------------------------\n")
+	fmt.Printf("Config\n")
+	fmt.Printf("-----------------------------------------------------------------\n\n")
+
+	envPath := dotEnvPath()
+	if abs, err := filepath.Abs(envPath); err == nil {
+		envPath = abs
+	}
+	if _, err := os.Stat(envPath); err == nil {
+		fmt.Printf("  To modify edit %s\n\n", envPath)
+	} else {
+		fmt.Printf("  To modify create %s\n\n", envPath)
+	}
+
 	fmt.Printf("  PANAUDIA_HOST:               %v\n", cfg.Host)
 	fmt.Printf("  PANAUDIA_PORT:               %d\n", cfg.Port)
 	fmt.Printf("  PANAUDIA_GOMAXPROCS:         %d\n", cfg.GoMaxProcs)
@@ -139,6 +335,7 @@ func main() {
 	fmt.Printf("  PANAUDIA_ICE_PORT:           %d\n", cfg.ICEPort)
 	fmt.Printf("  PANAUDIA_TLS_CTR_PATH:       %v\n", cfg.TLSCrtPath)
 	fmt.Printf("  PANAUDIA_TLS_KEY_PATH:       %v\n", cfg.TLSKeyPath)
+	fmt.Printf("  PANAUDIA_TLS_AUTOGEN:        %d\n", cfg.AutoGenTLS)
 	fmt.Printf("  PANAUDIA_TICKET_KEY_PATH:    %v\n", cfg.TicketKeyPath)
 	fmt.Printf("  PANAUDIA_UNTICKETED:         %d\n", cfg.Unticketed)
 	fmt.Printf("  PANAUDIA_SPACE_SIZE:         %v\n", cfg.SpaceSize)
@@ -154,6 +351,20 @@ func main() {
 	fmt.Printf("  PANAUDIA_TEST_VOICES:        %d\n", cfg.TestVoices)
 	fmt.Printf("  PANAUDIA_STEREO_TEST:        %d\n", cfg.StereoTest)
 	fmt.Printf("  PANAUDIA_LOG_LEVEL:          %v\n", cfg.LogLevel)
+
+	licDir := licensesDir()
+	if _, err := os.Stat(filepath.Join(licDir, "LICENSE")); err == nil {
+
+		fmt.Printf("-----------------------------------------------------------------\n")
+		fmt.Printf("Licenses \n")
+		fmt.Printf("-----------------------------------------------------------------\n")
+
+		if abs, e := filepath.Abs(licDir); e == nil {
+			licDir = abs
+		}
+		fmt.Printf("  %s/LICENSE\n", licDir)
+		fmt.Printf("  %s/third-party-licences.md\n", licDir)
+	}
 
 	fmt.Printf("-----------------------------------------------------------------\n")
 	fmt.Printf("Transport \n")
@@ -194,7 +405,16 @@ func main() {
 	// identically to the plain backend, and additionally mints ROC
 	// connection handlers when Panaudia Link is enabled.
 	backend := directroc.NewDirectRocBackend(common.ChannelCountForOrder(order), cfg.MaxSources)
-	authoriser := direct.NewDirectAuthoriser(cfg.TicketKeyPath, order, commands.DefaultAuthorizer(), backend.KickGate)
+	// The ticket key only verifies JWTs; it is required only when ticketed. When
+	// unticketed (the default) and no key file is present — e.g. a fresh checkout
+	// or a bundle that ships none — run without it instead of failing to start.
+	ticketKeyPath := cfg.TicketKeyPath
+	if unticketed {
+		if _, err := os.Stat(ticketKeyPath); err != nil {
+			ticketKeyPath = ""
+		}
+	}
+	authoriser := direct.NewDirectAuthoriser(ticketKeyPath, order, commands.DefaultAuthorizer(), backend.KickGate)
 	s := direct.NewDefaultDirectSpace(float64(cfg.SpaceSize), order, cfg.ReverbPreset, cfg.MaxSources)
 	backend.SetSpace(s)
 	s.SourceManager = backend

@@ -31,3 +31,6 @@ moq-test-page/
 
 CLAUDE.md
 
+
+# macOS bundle build output (scripts/bundle_macos)
+/dist/

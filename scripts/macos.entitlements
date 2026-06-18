@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Hardened-runtime entitlements for the Panaudia server binary.
+
+	  We bundle 8 non-Apple dylibs (libroc, libssl, libopus, ...). Library
+	  validation under the hardened runtime allows a binary to load dylibs
+	  signed by Apple OR by the SAME Team ID. Since sign_and_notarize_macos
+	  signs every dylib with the same Developer ID (Team 63PT2H4G8K) as the
+	  binary, library validation is satisfied and we do NOT need
+	  com.apple.security.cs.disable-library-validation.
+
+	  If a clean-machine run or notarization ever reports a library-validation
+	  failure (e.g. a future dlopen of an unsigned/3rd-party-signed lib),
+	  uncomment the key below and re-sign.
+	-->
+	<!-- <key>com.apple.security.cs.disable-library-validation</key> <true/> -->
+</dict>
+</plist>

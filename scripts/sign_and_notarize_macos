@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# sign_and_notarize_macos — Phase 4 of the self-contained macOS bundle.
+#
+# Takes the relocatable dist/Panaudia.app produced by scripts/bundle_macos and
+# turns it into a publicly-distributable artifact:
+#
+#   1. Developer ID codesign, inside-out (Frameworks dylibs first, then the
+#      server Mach-O, then seal the whole .app) with the hardened runtime.
+#   2. Notarize the .app via notarytool, then staple the ticket onto it.
+#   3. Build a .dmg containing the stapled .app, notarize + staple the .dmg too,
+#      so the ticket survives download and first launch needs no network.
+#
+# The ad-hoc signatures bundle_macos applies are REPLACED here — Developer ID
+# signing must come last, after every install_name_tool edit (those invalidate
+# signatures). This script does not edit install names; it only (re)signs.
+#
+# Requirements:
+#   - A "Developer ID Application" identity in the keychain (override the auto-
+#     detected one with PANAUDIA_SIGN_IDENTITY="Developer ID Application: ...").
+#   - notarytool credentials stored as a keychain profile (see below). Pass the
+#     profile name as --notary-profile NAME or via PANAUDIA_NOTARY_PROFILE.
+#
+# Store credentials once (interactive), then reuse the profile name forever:
+#   xcrun notarytool store-credentials panaudia-notary \
+#       --apple-id "you@example.com" --team-id 63PT2H4G8K \
+#       --password "app-specific-password"
+#   # ...or with an App Store Connect API key:
+#   xcrun notarytool store-credentials panaudia-notary \
+#       --key AuthKey_XXXX.p8 --key-id XXXX --issuer XXXXXXXX-....
+#
+# Usage:
+#   scripts/sign_and_notarize_macos                 # sign only (no profile)
+#   scripts/sign_and_notarize_macos --notary-profile panaudia-notary
+#   PANAUDIA_NOTARY_PROFILE=panaudia-notary scripts/sign_and_notarize_macos
+#
+# Without a notary profile the script stops after signing + local verification,
+# which is useful for iterating on the signature before spending a notary round
+# trip. See plan/macos-bundle/plan.md, Phase 4. Stock /bin/bash 3.2 compatible.
+
+set -euo pipefail
+
+# --- config -----------------------------------------------------------------
+APP_NAME="Panaudia"
+SERVER_NAME="panaudia-server"
+BUNDLE_ID="com.panaudia.panaudia"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+DIST_DIR="$REPO_ROOT/dist"
+APP="$DIST_DIR/$APP_NAME.app"
+CONTENTS="$APP/Contents"
+FRAMEWORKS_DIR="$CONTENTS/Frameworks"
+SERVER_BIN="$CONTENTS/MacOS/$SERVER_NAME"
+ENTITLEMENTS="$SCRIPT_DIR/macos.entitlements"
+
+VERSION="$(cat "$REPO_ROOT/version" 2>/dev/null || echo "0.0.0")"
+DMG="$DIST_DIR/$APP_NAME-$VERSION.dmg"
+
+# Where finished artifacts are published, one folder per version.
+PUBLISH_DIR="$REPO_ROOT/../dist/panaudia/mac/$VERSION"
+
+# --- args -------------------------------------------------------------------
+NOTARY_PROFILE="${PANAUDIA_NOTARY_PROFILE:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --notary-profile) NOTARY_PROFILE="$2"; shift 2 ;;
+    --notary-profile=*) NOTARY_PROFILE="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- preflight --------------------------------------------------------------
+[ -d "$APP" ] || die "$APP not found — run scripts/bundle_macos first."
+
+# Resolve the Developer ID Application identity (SHA-1 is unambiguous for codesign).
+IDENTITY="${PANAUDIA_SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+  IDENTITY="$(security find-identity -v -p codesigning \
+    | grep 'Developer ID Application' | head -1 \
+    | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-F]+).*/\1/')"
+fi
+[ -n "$IDENTITY" ] || die "No 'Developer ID Application' identity found. \
+Install one from developer.apple.com, or set PANAUDIA_SIGN_IDENTITY."
+log "Signing identity: $IDENTITY"
+[ -f "$ENTITLEMENTS" ] || die "Missing entitlements file: $ENTITLEMENTS"
+
+# --- 1. sign inside-out -----------------------------------------------------
+# Dylibs first (leaves of the load graph), then the server Mach-O with the
+# hardened runtime + entitlements, then seal the whole .app (covers the launcher
+# script + Info.plist + CodeResources). --force replaces the ad-hoc signatures.
+log "Signing ${FRAMEWORKS_DIR##*/} dylibs (hardened runtime)"
+for m in "$FRAMEWORKS_DIR"/*.dylib; do
+  codesign --force --options runtime --timestamp \
+    --sign "$IDENTITY" "$m"
+  printf '    signed %s\n' "$(basename "$m")"
+done
+
+log "Signing server binary (hardened runtime + entitlements)"
+codesign --force --options runtime --timestamp \
+  --entitlements "$ENTITLEMENTS" \
+  --sign "$IDENTITY" "$SERVER_BIN"
+
+log "Sealing the .app bundle"
+codesign --force --options runtime --timestamp \
+  --sign "$IDENTITY" "$APP"
+
+# --- 2. verify the signature locally ----------------------------------------
+log "Verifying signatures (codesign --verify --deep --strict)"
+codesign --verify --deep --strict --verbose=2 "$APP"
+log "Inspecting bundle seal"
+codesign --display --verbose=2 "$APP" 2>&1 | grep -E 'Authority|TeamIdentifier|Identifier|flags' || true
+
+# spctl will report "rejected (Unnotarized Developer ID)" until the ticket is
+# stapled — that is expected at this point, so don't treat it as fatal.
+log "Gatekeeper assessment (pre-notarization — 'Unnotarized' is expected here)"
+spctl -a -vvv -t exec "$APP" 2>&1 || true
+
+if [ -z "$NOTARY_PROFILE" ]; then
+  echo
+  log "Signed OK. No --notary-profile given, so stopping before notarization."
+  echo "  To notarize + staple, store credentials once then re-run:"
+  echo "    xcrun notarytool store-credentials panaudia-notary \\"
+  echo "        --apple-id <id> --team-id 63PT2H4G8K --password <app-specific-pw>"
+  echo "    scripts/sign_and_notarize_macos --notary-profile panaudia-notary"
+  exit 0
+fi
+
+# --- 3. notarize + staple the .app ------------------------------------------
+# notarytool needs a single file: zip the .app (ditto preserves the bundle).
+APP_ZIP="$DIST_DIR/$APP_NAME-$VERSION.zip"
+log "Zipping .app for notarization -> ${APP_ZIP##*/}"
+rm -f "$APP_ZIP"
+/usr/bin/ditto -c -k --keepParent "$APP" "$APP_ZIP"
+
+log "Submitting .app to notarytool (this can take a few minutes)"
+xcrun notarytool submit "$APP_ZIP" \
+  --keychain-profile "$NOTARY_PROFILE" --wait \
+  || die "notarization failed — run: xcrun notarytool log <submission-id> --keychain-profile $NOTARY_PROFILE"
+
+log "Stapling ticket onto the .app"
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP"
+rm -f "$APP_ZIP"
+
+# Now Gatekeeper should accept it offline.
+log "Gatekeeper assessment (post-staple — expect 'accepted')"
+spctl -a -vvv -t exec "$APP" 2>&1 || true
+
+# --- 4. build, sign, notarize, staple the .dmg ------------------------------
+log "Building disk image -> ${DMG##*/}"
+rm -f "$DMG"
+STAGING="$(mktemp -d)"
+/usr/bin/ditto "$APP" "$STAGING/$APP_NAME.app"
+ln -s /Applications "$STAGING/Applications"
+hdiutil create -volname "$APP_NAME $VERSION" -srcfolder "$STAGING" \
+  -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGING"
+
+log "Signing the .dmg"
+codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+
+log "Notarizing the .dmg"
+xcrun notarytool submit "$DMG" \
+  --keychain-profile "$NOTARY_PROFILE" --wait \
+  || die "dmg notarization failed — check: xcrun notarytool log <id> --keychain-profile $NOTARY_PROFILE"
+
+log "Stapling ticket onto the .dmg"
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+
+# --- 5. publish artifacts to ../dist/panaudia/<version> ---------------------
+# Copy the finished .app and .dmg into a versioned folder outside the repo,
+# overwriting anything already there for this version.
+log "Publishing artifacts -> $PUBLISH_DIR"
+mkdir -p "$PUBLISH_DIR"
+rm -rf "$PUBLISH_DIR/$APP_NAME.app"
+/usr/bin/ditto "$APP" "$PUBLISH_DIR/$APP_NAME.app"
+/usr/bin/ditto "$DMG" "$PUBLISH_DIR/$(basename "$DMG")"
+
+echo
+log "DONE — distributable, notarized, stapled:"
+echo "  App: $APP"
+echo "  DMG: $DMG"
+echo "  Published to: $PUBLISH_DIR"
+echo "  Verify on this machine:  spctl -a -vvv -t exec \"$APP\""
+echo "  Verify the dmg:          xcrun stapler validate \"$DMG\""

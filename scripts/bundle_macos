@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+#
+# bundle_macos — Phase 1 of the self-contained macOS bundle.
+#
+# Builds the server, assembles a relocatable Panaudia.app, copies in every
+# non-system dynamic library it links, rewrites their install names to @rpath so
+# they load from Contents/Frameworks/, ships the runtime assets (self-signed
+# keys + .env.example), and ad-hoc signs everything so it runs locally.
+#
+# Bundle entry point (CFBundleExecutable) is a small launcher script
+# (Contents/MacOS/panaudia) that opens Terminal running the real, headless server
+# binary (Contents/MacOS/panaudia-server). The server binary itself knows nothing
+# about Terminal — run it directly for headless/CLI/launchd use.
+#
+# This does NOT do Developer ID signing / notarization — that is Phase 4
+# (scripts/sign_and_notarize_macos). The ad-hoc signature here is only so the
+# bundle is runnable on the build machine for verification.
+#
+# See plan/macos-bundle/plan.md. Compatible with stock /bin/bash 3.2.
+
+set -euo pipefail
+
+# --- config -----------------------------------------------------------------
+APP_NAME="Panaudia"
+LAUNCHER_NAME="panaudia"         # CFBundleExecutable — opens Terminal
+SERVER_NAME="panaudia-server"    # the headless Go server (pristine)
+BUNDLE_ID="com.panaudia.panaudia"
+MIN_MACOS="11.0"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+DIST_DIR="$REPO_ROOT/dist"
+APP="$DIST_DIR/$APP_NAME.app"
+CONTENTS="$APP/Contents"
+MACOS_DIR="$CONTENTS/MacOS"
+FRAMEWORKS_DIR="$CONTENTS/Frameworks"
+RESOURCES_DIR="$CONTENTS/Resources"
+SERVER_BIN="$MACOS_DIR/$SERVER_NAME"
+LAUNCHER="$MACOS_DIR/$LAUNCHER_NAME"
+
+# App icon (optional). Provide ONE of:
+#   assets/icon.png   1024x1024 PNG  -> converted to .icns here (preferred)
+#   assets/icon.icns  ready-made     -> copied as-is
+# If neither exists the bundle builds without an icon (generic placeholder).
+ICON_NAME="AppIcon"                  # -> Contents/Resources/AppIcon.icns
+ICON_PNG="$REPO_ROOT/assets/icon.png"
+ICON_ICNS="$REPO_ROOT/assets/icon.icns"
+
+VERSION="$(cat "$REPO_ROOT/version" 2>/dev/null || echo "0.0.0")"
+
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+# --- helpers ----------------------------------------------------------------
+
+# is_system_lib PATH -> 0 if a macOS-provided library we must NOT bundle.
+is_system_lib() {
+  case "$1" in
+    /usr/lib/*|/System/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# deps MACHO -> prints each dependency install path, one per line. Skips the
+# `file:` header and the dylib's own LC_ID line (its basename matches the file).
+deps() {
+  local f="$1" self
+  self="$(basename "$f")"
+  otool -L "$f" | tail -n +2 | awk '{print $1}' | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    [ "$(basename "$p")" = "$self" ] && continue
+    printf '%s\n' "$p"
+  done
+}
+
+# make_icns SRC_PNG OUT_ICNS -> build a multi-resolution .icns from a 1024px PNG.
+# Emits the 10 sizes Apple's iconset convention expects (each base size + its @2x
+# retina variant) via sips, then packs them with iconutil.
+make_icns() {
+  local src="$1" out="$2" set
+  set="$(mktemp -d)/icon.iconset"
+  mkdir -p "$set"
+  # name=pixels pairs; @2x entries are double the named size.
+  for spec in \
+    16x16:16 16x16@2x:32 32x32:32 32x32@2x:64 \
+    128x128:128 128x128@2x:256 256x256:256 256x256@2x:512 \
+    512x512:512 512x512@2x:1024; do
+    local label="${spec%%:*}" px="${spec##*:}"
+    sips -z "$px" "$px" "$src" --out "$set/icon_${label}.png" >/dev/null
+  done
+  iconutil -c icns "$set" -o "$out"
+  rm -rf "$(dirname "$set")"
+}
+
+# --- 1. build the server binary ---------------------------------------------
+log "Building server binary (go build -tags=accelerate)"
+rm -rf "$APP"
+mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
+go build -tags=accelerate -o "$SERVER_BIN" .
+
+# --- 2. resolve & copy the dylib closure ------------------------------------
+# Breadth-first walk from the SERVER binary (the launcher is a script with no
+# dylibs). A library is bundled iff referenced by an absolute, non-system path.
+# The file already existing in Frameworks/ is the dedup marker (bash-3.2 safe).
+log "Resolving dynamic library closure"
+QUEUE=("$SERVER_BIN")
+qi=0
+while [ "$qi" -lt "${#QUEUE[@]}" ]; do
+  cur="${QUEUE[$qi]}"
+  qi=$((qi + 1))
+  while IFS= read -r dep; do
+    [ -z "$dep" ] && continue
+    case "$dep" in @*) continue ;; esac   # already relocated/relative
+    if is_system_lib "$dep"; then continue; fi
+    base="$(basename "$dep")"
+    if [ ! -e "$FRAMEWORKS_DIR/$base" ]; then
+      cp -f "$dep" "$FRAMEWORKS_DIR/$base"   # cp dereferences symlink sources
+      chmod u+w "$FRAMEWORKS_DIR/$base"
+      QUEUE+=("$FRAMEWORKS_DIR/$base")
+      printf '    + %s\n' "$base"
+    fi
+  done < <(deps "$cur")
+done
+log "Bundled $(($(ls -1 "$FRAMEWORKS_DIR" | wc -l))) dylib(s)"
+
+# --- 3. rewrite install names to @rpath -------------------------------------
+# Deterministic rule (same predicate as discovery): every absolute, non-system
+# dependency becomes @rpath/<basename>; each dylib's own ID becomes @rpath too.
+log "Rewriting install names -> @rpath"
+rewrite() {
+  local m="$1"
+  chmod u+w "$m"
+  if [ "$m" != "$SERVER_BIN" ]; then
+    install_name_tool -id "@rpath/$(basename "$m")" "$m"
+  fi
+  while IFS= read -r dep; do
+    [ -z "$dep" ] && continue
+    case "$dep" in @*) continue ;; esac
+    if is_system_lib "$dep"; then continue; fi
+    install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$m"
+  done < <(deps "$m")
+}
+rewrite "$SERVER_BIN"
+for m in "$FRAMEWORKS_DIR"/*.dylib; do rewrite "$m"; done
+
+# --- 4. rpaths --------------------------------------------------------------
+# A single rpath on the server binary resolves @rpath for the whole load chain,
+# because @executable_path is anchored to it regardless of which image holds the
+# reference. @loader_path on each dylib is insurance for a direct dlopen. Drop
+# the /usr/local/lib rpath baked by cgo.
+log "Setting rpaths"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$SERVER_BIN" 2>/dev/null || true
+install_name_tool -delete_rpath "/usr/local/lib" "$SERVER_BIN" 2>/dev/null || true
+for m in "$FRAMEWORKS_DIR"/*.dylib; do
+  install_name_tool -add_rpath "@loader_path" "$m" 2>/dev/null || true
+done
+
+# --- 5. launcher script (bundle entry point) --------------------------------
+# Launch Services runs this on double-click. It opens a Terminal window running
+# the headless server so the banner/logs are visible — the same path Finder uses
+# for a bare executable. The server binary stays unaware of any of this.
+log "Writing launcher (Contents/MacOS/$LAUNCHER_NAME)"
+cat > "$LAUNCHER" <<LAUNCH
+#!/bin/bash
+here="\$(cd "\$(dirname "\$0")" && pwd)"
+exec /usr/bin/open -a Terminal "\$here/$SERVER_NAME"
+LAUNCH
+chmod +x "$LAUNCHER"
+
+# --- 6. runtime assets ------------------------------------------------------
+# Nothing config-related ships in the bundle. On first launch the server writes
+# its config/data to ~/Library/Application Support/Panaudia/: it auto-generates a
+# self-signed TLS cert into keys/, and reads an optional .env there. The JWT
+# ticket key is operator-supplied (only needed when ticketed). This keeps the
+# real production private key OUT of the distributable and lets each install own
+# its own cert. See plan/macos-bundle/plan.md, Phase 2.
+#
+# The ONE thing that may ship in Resources/ is the app icon: it's a static asset
+# sealed by the code signature (unlike config, it never changes post-signing), so
+# it doesn't break notarization. Prefer assets/icon.png (converted), else a
+# ready-made assets/icon.icns; if neither exists the bundle gets the generic icon.
+ICON_PLIST_LINE=""
+if [ -f "$ICON_PNG" ]; then
+  log "Generating app icon from assets/icon.png"
+  make_icns "$ICON_PNG" "$RESOURCES_DIR/$ICON_NAME.icns"
+  ICON_PLIST_LINE="	<key>CFBundleIconFile</key>        <string>${ICON_NAME}</string>"
+elif [ -f "$ICON_ICNS" ]; then
+  log "Installing app icon from assets/icon.icns"
+  cp -f "$ICON_ICNS" "$RESOURCES_DIR/$ICON_NAME.icns"
+  ICON_PLIST_LINE="	<key>CFBundleIconFile</key>        <string>${ICON_NAME}</string>"
+else
+  log "No assets/icon.png or assets/icon.icns — bundling without a custom icon"
+fi
+
+# License texts are immutable distribution artifacts, so (like the icon) they
+# ship in Resources/ where the code signature seals them. They are NOT copied
+# into the config dir — the server just points at this dir from its banner.
+log "Bundling license files into Resources/"
+for f in LICENSE third-party-licences.md; do
+  if [ -f "$REPO_ROOT/$f" ]; then
+    cp -f "$REPO_ROOT/$f" "$RESOURCES_DIR/$f"
+    printf '    + %s\n' "$f"
+  else
+    printf '    ! missing %s (skipped)\n' "$f"
+  fi
+done
+
+# --- 7. Info.plist ----------------------------------------------------------
+# LSUIElement: the launcher is an agent (no Dock icon); it exits right after
+# spawning Terminal, so there's no lingering UI. The visible window is Terminal's.
+log "Writing Info.plist"
+cat > "$CONTENTS/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>            <string>${APP_NAME}</string>
+	<key>CFBundleDisplayName</key>     <string>${APP_NAME}</string>
+	<key>CFBundleExecutable</key>      <string>${LAUNCHER_NAME}</string>
+${ICON_PLIST_LINE}
+	<key>CFBundleIdentifier</key>      <string>${BUNDLE_ID}</string>
+	<key>CFBundlePackageType</key>     <string>APPL</string>
+	<key>CFBundleShortVersionString</key> <string>${VERSION}</string>
+	<key>CFBundleVersion</key>         <string>${VERSION}</string>
+	<key>LSMinimumSystemVersion</key>  <string>${MIN_MACOS}</string>
+	<key>LSUIElement</key>             <true/>
+	<key>NSHighResolutionCapable</key> <true/>
+</dict>
+</plist>
+PLIST
+
+# --- 8. ad-hoc sign (local run only) ----------------------------------------
+# Must come AFTER all install_name_tool edits, which invalidate signatures.
+# Sign inside-out: dylibs, then the server Mach-O, then seal the whole bundle
+# (covers the launcher script + Info.plist). Phase 4 re-signs with Developer ID.
+log "Ad-hoc signing (local run; Phase 4 re-signs with Developer ID)"
+for m in "$FRAMEWORKS_DIR"/*.dylib; do
+  codesign --force --sign - --timestamp=none "$m"
+done
+codesign --force --sign - --timestamp=none "$SERVER_BIN"
+codesign --force --sign - --timestamp=none "$APP"
+
+# --- 9. audit self-containment ----------------------------------------------
+log "Auditing self-containment"
+leak=0
+for m in "$SERVER_BIN" "$FRAMEWORKS_DIR"/*.dylib; do
+  bad="$(otool -L "$m" | tail -n +2 | awk '{print $1}' | grep -E '^/usr/local/|^/opt/' || true)"
+  if [ -n "$bad" ]; then
+    printf '  LEAK in %s:\n' "$(basename "$m")"
+    printf '%s\n' "$bad" | sed 's/^/    /'
+    leak=1
+  fi
+done
+if [ "$leak" -ne 0 ]; then
+  echo "FAILED: external (/usr/local or /opt) references remain — not self-contained." >&2
+  exit 1
+fi
+
+log "OK — bundle is self-contained: $APP"
+echo
+echo "  Double-click:   opens Terminal running the server (via the launcher)"
+echo "  Headless/CLI:   $SERVER_BIN"
+echo "  Inspect:        otool -L \"$SERVER_BIN\""
+echo "  Verify loads:   DYLD_PRINT_LIBRARIES=1 \"$SERVER_BIN\"   (before Phase 4 signing)"
+echo "  Next:           Phase 3 (clean-machine test), Phase 4 (Developer ID sign + notarize)"
