@@ -3,20 +3,67 @@
 
 [panaudia.com](https://panaudia.com/)
 
-Panaudia is a network spatial audio engine: a server for connecting people across the network in shared, virtual audio spaces. 
-To achieve this Panaudia combines a WebRTC and Media Over QUIC audio server with a powerful ambisonic mixer and a binaural rendering engine.
+Panaudia is a network spatial audio engine: a server for connecting people across the network in shared, virtual audio spaces.
 
-There are TypeScript and Unreal Engine clients, and a test page for manual testing in [panaudia-client](https://github.com/panaudia/panaudia-client)
+It's a live audio streaming media server combined with an ambisonic mixer and a binaural rendering engine. 
+We also have client software for connecting to the server.
 
-It also uses [Roc Toolkit](https://roc-streaming.org) to stream RTP uncompressed object-based audio in, and multichannel ambisonic audio out.
+This is mostly a Go project but some parts are in C.
 
+### Streaming protocols
+- **WebRTC** provided using go [pion project](https://github.com/pion).
+- **MoQ** using the [eyevinn fork of moqtransport](https://github.com/eyevinn/moqtransport) which is at draft-16.
+- **RTP + RTCP + FEC** — using [Roc Toolkit](https://roc-streaming.org).
 
+### Codecs
+For compressed audio we use Opus at 48kbps per channel which seems to be a high enough bitrate to preserve spatial imaging.
 
-## Install & Build
+We also stream uncompressed 32-bit pcm over RTP using Panaudia Link. 
+You need decent bandwidth to do this but it gives broadcast quality i/o.
 
-- **[Install & build on macOS](docs/install-macos.md)** — set up the native
-  dependencies and build the server from source.
-- **[Linux Docker builds](/docker/readme.md)**  - build scripts for arm64 and amd64 linux docker images
+### Ambisonic Mixing
+
+Panaudia is designed to support large numbers of sources and sinks in real-time, each source providing audio and each sink receiving back binaural mix of all the sources. 
+Often all users will be both sources and sinks so the mixer is performing n x n spatialised mixes. 
+We have tried to take a balanced approach to mixing that gives high enough quality spatialised rendering 
+that can still support large numbers of simultaneous mixes in real-time.  Our cloud version can support ~500 users with 2nd order 
+ambisonics, the stand alone one can support ~200 or fewer if you turn it up to 5th order.
+
+| Ambisonics             |              |
+|------------------------|--------------|
+| Bit depth              | 32           |
+| Sampling rate          | 48kHz        |
+| Frame size             | 5ms          |
+| Format                 | ACN N3D/SN3D |
+| Order                  | 2nd - 5th    |
+
+We recalculate ambisonic weights for every source/sink pair every frame and then smoothly blend 
+between previous and current frame weights. We also use a simple parametric room reverb and do a wet/dry mix based on distance.
+
+The underlying intensive maths operations for ambisonic mixing are many small matrix multiplications on vectors with new data every time. 
+We have played with optimising this quite a bit, our current favourite for servers is OpenBLAS on AMD Milan chipsets, 
+which is slightly faster than IPP on Intel,
+but Apple's shared memory architecture and their Accelerate intrinsics are faster than either! 
+Using NVIDIA's cuBLAS on GPUs is slower than both due to the price paid for moving memory around, 
+but we expect this to improve with their better use of shared memory.
+
+### Binaural Rendering
+
+We use the excellent binaural renderer from the [Spatial Audio Framework](https://github.com/leomccormack/Spatial_Audio_Framework). 
+We have found its Magnitude Least Squares decoder gives the great perceptual results. 
+At the moment we are just using the frameworks included default HRTF which is taken from a KEMAR test head, 
+we will be adding the ability to use your own custom SOFA files.
+
+## Pre-built binaries
+
+We provide prebuilt binaries in the form of a Mac silicon app and Docker images for Linux on arm or amd. 
+
+They are built using the scripts in this repo and you can find them on the website's [software page](https://panaudia.com/software)
+
+## Install and build from source
+
+There are detailed instructions on how to [install and build on macOS](docs/install-macos.md) as this is how I work.
+If you want to build on Linux have a look at the mac instructions and in the Dockerfiles for reference.
 
 ## Running the server
 
@@ -24,9 +71,6 @@ There is a single entry point at the repo root (`main.go`): a unified server
 that serves **MOQ** (UDP) and **WebRTC** (TCP) over one port, plus **Panaudia
 Link (ROC)** when enabled.
 
-> **First time on macOS?** Follow **[docs/install-macos.md](docs/install-macos.md)**
-> first — it installs the native (cgo) dependencies the build needs. Once those
-> are in place, build and run from source:
 
 ```
 cd /Users/paul/Dropbox/glowinthedark/panaudia/code/panaudia/panaudia
