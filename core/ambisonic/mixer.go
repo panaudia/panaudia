@@ -2,6 +2,8 @@ package ambisonic
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"unsafe"
 
 	"github.com/panaudia/panaudia/core/common"
@@ -9,6 +11,27 @@ import (
 	"gonum.org/v1/gonum/blas"
 	"gonum.org/v1/gonum/blas/blas32"
 )
+
+// useGonumMixer selects the pure-Go gonum BLAS mixing path (Mix2) over the
+// native cBLAS path (Mix) when PANAUDIA_MIXER_GONUM is truthy. The native path
+// is faster per call but races on OpenBLAS's shared scratch pool under
+// concurrent calls (Debian's OpenBLAS lacks USE_LOCKING=1); the gonum path is
+// reentrant and so runs safely in parallel across all render workers. Output is
+// sample-for-sample equivalent (see mix_parity_test.go). Background:
+// ../../../cloud-mixer/plan/clustering-crackle/findings.md (Fix F).
+var useGonumMixer = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PANAUDIA_MIXER_GONUM"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}()
+
+func init() {
+	if useGonumMixer {
+		common.LogInfo("ambisonic mixer: PANAUDIA_MIXER_GONUM set — using pure-Go gonum BLAS path")
+	}
+}
 
 type Mixer struct {
 	inputTotalCount   int
@@ -71,15 +94,19 @@ func (mixer *Mixer) PrintState() {
 
 func (mixer *Mixer) Mix(output []float32) {
 
-	spacer.Panaudia_utils_internal_encode(mixer.inputTotalCount,
-		mixer.mixerConfig.ChannelCount,
-		mixer.inputTotalCount,
-		mixer.mixerConfig.FrameSize,
-		uintptr(unsafe.Pointer(&mixer.packedInputs[0])),
-		uintptr(unsafe.Pointer(&mixer.packedWeights[0])),
-		uintptr(unsafe.Pointer(&mixer.previousPackedWeights[0])),
-		uintptr(unsafe.Pointer(&output[0])),
-		uintptr(unsafe.Pointer(&mixer.tempMix[0])))
+	if useGonumMixer {
+		mixer.Mix2(output)
+	} else {
+		spacer.Panaudia_utils_internal_encode(mixer.inputTotalCount,
+			mixer.mixerConfig.ChannelCount,
+			mixer.inputTotalCount,
+			mixer.mixerConfig.FrameSize,
+			uintptr(unsafe.Pointer(&mixer.packedInputs[0])),
+			uintptr(unsafe.Pointer(&mixer.packedWeights[0])),
+			uintptr(unsafe.Pointer(&mixer.previousPackedWeights[0])),
+			uintptr(unsafe.Pointer(&output[0])),
+			uintptr(unsafe.Pointer(&mixer.tempMix[0])))
+	}
 
 	mixer.MixCount += mixer.inputTotalCount
 }
