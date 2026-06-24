@@ -309,7 +309,7 @@ func (encoder *Encoder) EncodePeers(peers []*Encoder, dryMixer *Mixer, reverbMix
 
 			GetWeightsForReverb(weightsView,
 				reverbWeightsView,
-				peer.sphericalHarmonics,
+				encoder.sphericalHarmonics,
 				peer.gainFactor,
 				peer.peerAttenuationExponent,
 				encoder.Position,
