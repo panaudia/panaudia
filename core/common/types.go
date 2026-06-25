@@ -276,6 +276,23 @@ func float64FromQuery(name string, queryValues map[string][]string) (float64, er
 	return value, nil
 }
 
+// SubspacesFromQuery parses repeated `subspaces` query params into a UUID
+// slice (mirrors the per-node `subspaces` list carried on the ROC input
+// path). The param is list-capable — one `subspaces=<uuid>` item per
+// subspace — though clients currently send at most one. An invalid UUID is
+// an error; an absent param yields an empty (non-nil) slice.
+func SubspacesFromQuery(queryValues map[string][]string) ([]uuid.UUID, error) {
+	subspaces := make([]uuid.UUID, 0)
+	for _, raw := range queryValues["subspaces"] {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return nil, errors.New("Invalid value for subspace")
+		}
+		subspaces = append(subspaces, id)
+	}
+	return subspaces, nil
+}
+
 func Uint32FromQuery(name string, queryValues map[string][]string) (uint32, error) {
 	values := queryValues[name]
 	if len(values) == 0 {

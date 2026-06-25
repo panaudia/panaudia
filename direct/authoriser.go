@@ -233,6 +233,11 @@ func (authoriser *DirectAuthoriser) GetRocOutConfig(queryValues map[string][]str
 		return common.RocOutputConfig{}, errors.New("Ambisonic order mismatch")
 	}
 
+	nodeConfig.SubSpaces, err = common.SubspacesFromQuery(queryValues)
+	if err != nil {
+		return common.RocOutputConfig{}, err
+	}
+
 	nodeConfig.Position = common.PositionFromFromQuery(queryValues)
 	nodeConfig.ReturnData = false
 	nodeConfig.Gain = 1.0
