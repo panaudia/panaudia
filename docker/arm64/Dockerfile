@@ -1,9 +1,39 @@
 FROM golang:1.26.4-trixie AS builder
 
-RUN apt-get update && apt-get install -y build-essential git wget gpg cmake scons swig\
-    liblapack3 liblapack-dev libopenblas-serial-dev libopenblas0 libopenblas-dev \
-    liblapacke-dev pkg-config libopus-dev libopusfile-dev \
+RUN apt-get update && apt-get install -y build-essential gfortran git wget gpg cmake scons swig \
+    pkg-config libopus-dev libopusfile-dev \
     ragel gengetopt libuv1-dev libunwind-dev libspeexdsp-dev libssl-dev
+
+# --- Reentrant OpenBLAS, built from source with USE_LOCKING=1 -----------------
+# Debian's packaged OpenBLAS is built WITHOUT USE_LOCKING=1, so concurrent
+# cblas_sgemm calls from the render workers race on the shared blas_memory_alloc
+# scratch pool -> corrupted GEMM output -> crackle under load. See
+# ../cloud-mixer/plan/clustering-crackle/findings.md. We build OpenBLAS ourselves
+# with:
+#   USE_LOCKING=1 - guards only the tiny buffer alloc/free, NOT the GEMM compute,
+#                   so calls stay reentrant AND run concurrently (~native speed).
+#   USE_THREAD=0  - no internal OpenBLAS thread pool; parallelism comes from the
+#   USE_OPENMP=0    GOMAXPROCS render workers, so internal threads would only
+#                   oversubscribe. This is the documented "single-threaded build
+#                   called from multiple threads" case that USE_LOCKING exists for.
+#   DYNAMIC_ARCH=1- fat binary with runtime CPU-kernel selection; the build runs
+#                   under buildx/QEMU emulation, so we must not bake -march=native.
+#   NO_STATIC=1   - shared only, preserving dynamic binding (the SAF/utils static
+#                   archives leave cblas_sgemm undefined and resolve it at load).
+# Bundles its own LAPACK (gfortran) + LAPACKE, so Debian's BLAS/LAPACK packages
+# are dropped entirely. -lopenblas and -llapacke (spacer/flags.go) both resolve
+# to this one libopenblas.so via the /usr/local/lib symlinks below.
+ARG OPENBLAS_VERSION=v0.3.30
+RUN git clone --branch ${OPENBLAS_VERSION} --depth 1 https://github.com/OpenMathLib/OpenBLAS.git /tmp/openblas \
+ && cd /tmp/openblas \
+ && make -j"$(nproc)" USE_THREAD=0 USE_OPENMP=0 USE_LOCKING=1 NUM_THREADS=1 \
+        DYNAMIC_ARCH=1 NO_STATIC=1 NO_LAPACK=0 PREFIX=/opt/openblas \
+ && make PREFIX=/opt/openblas install \
+ && cd / && rm -rf /tmp/openblas \
+ && ln -sf /opt/openblas/lib/libopenblas.so   /usr/local/lib/libopenblas.so \
+ && ln -sf /opt/openblas/lib/libopenblas.so.0 /usr/local/lib/libopenblas.so.0 \
+ && ln -sf /opt/openblas/lib/libopenblas.so   /usr/local/lib/liblapacke.so \
+ && echo "/opt/openblas/lib" > /etc/ld.so.conf.d/openblas.conf && ldconfig
 
 RUN mkdir -m 700 /root/.ssh; \
   touch -m 600 /root/.ssh/known_hosts; \
@@ -49,9 +79,14 @@ ARG TARGETPLATFORM
 ENV TARGETPLATFORM=${TARGETPLATFORM}
 RUN echo $TARGETPLATFORM
 
+# Point SAF at our from-source OpenBLAS (Debian's libopenblas-dev is no longer
+# installed, so find_library would otherwise miss it). -llapacke resolves to the
+# same libopenblas.so, so both header/library pairs point at /opt/openblas.
+ENV OPENBLAS_CMAKE="-DOPENBLAS_LIBRARY=/opt/openblas/lib/libopenblas.so -DLAPACKE_LIBRARY=/opt/openblas/lib/libopenblas.so -DOPENBLAS_HEADER_PATH=/opt/openblas/include -DLAPACKE_HEADER_PATH=/opt/openblas/include"
+
 RUN if [ "$TARGETPLATFORM" = "linux/amd64" ] ; \
-  then cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=1 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0 ; \
-  else cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=0 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0 ; fi
+  then cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=1 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0 $OPENBLAS_CMAKE ; \
+  else cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=0 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0 $OPENBLAS_CMAKE ; fi
 
 RUN cd build && make
 RUN ln -s /opt/panaudia/Spatial_Audio_Framework/build/examples/libsaf_example_ambi_bin.a /usr/local/lib/libsaf_example_ambi_bin.a
@@ -60,11 +95,11 @@ RUN ln -s /opt/panaudia/Spatial_Audio_Framework/build/framework/libsaf.a /usr/lo
 ## Build Panaudia C Utils
 WORKDIR /opt/panaudia/panaudia-utils
 
-RUN cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=0 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0  -DSAF_BUILD_EXAMPLES=0
+RUN cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=0 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0  -DSAF_BUILD_EXAMPLES=0 $OPENBLAS_CMAKE
 
 RUN if [ "$TARGETPLATFORM" = "linux/amd64" ] ; \
-  then cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=1 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0  -DSAF_BUILD_EXAMPLES=0 ; \
-  else cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=0 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0  -DSAF_BUILD_EXAMPLES=0 ; fi
+  then cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=1 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0  -DSAF_BUILD_EXAMPLES=0 $OPENBLAS_CMAKE ; \
+  else cmake -S . -B build -DSAF_PERFORMANCE_LIB=SAF_USE_OPEN_BLAS_AND_LAPACKE -DSAF_ENABLE_SIMD=0 -DSAF_BUILD_TESTS=0 -DSAF_BUILD_EXTRAS=0  -DSAF_BUILD_EXAMPLES=0 $OPENBLAS_CMAKE ; fi
 
 RUN cd build && make
 RUN ln -s /opt/panaudia/panaudia-utils/build/libpanaudia_utils.a /usr/local/lib/libpanaudia_utils.a
@@ -80,7 +115,14 @@ RUN GOOS=linux go build -tags 'openblas lapacke' -o ./main ./main.go
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y ca-certificates libopus0 libopusfile0 libuv1 libunwind8 libspeexdsp1 libzmq5 \
-    liblapack3 libopenblas0-serial libopenblas0 liblapacke libcap2-bin
+    libgfortran5 libcap2-bin
+
+# Reentrant OpenBLAS (USE_LOCKING=1) built from source in the builder stage,
+# replacing Debian's libopenblas0-serial. It carries its own bundled
+# LAPACK+LAPACKE, so liblapack3/liblapacke are no longer installed; libgfortran5
+# (above) satisfies the Fortran LAPACK runtime dependency. The binary's only BLAS
+# NEEDED entry is libopenblas.so.0 (both -lopenblas and -llapacke resolve here).
+COPY --from=builder /opt/openblas/lib/libopenblas.so.0 /usr/local/lib/libopenblas.so.0
 
 COPY --from=builder /usr/lib/libroc.so /usr/lib/libroc.so
 COPY --from=builder /usr/lib/libroc.so.0 /usr/lib/libroc.so.0
